@@ -17,6 +17,7 @@
 package gl
 
 import (
+	"fmt"
 	"unsafe"
 
 	"github.com/go-webgpu/goffi/ffi"
@@ -30,6 +31,7 @@ var (
 	cifUInt321       types.CallInterface // uint32 fn(uint32)
 	cifInt322        types.CallInterface // int32 fn(uint32, void*)
 	cifVoid1         types.CallInterface // void fn(uint32)
+	cifVoid1Ptr      types.CallInterface // void fn(void*)
 	cifVoid2         types.CallInterface // void fn(uint32, void*)
 	cifVoid2UU       types.CallInterface // void fn(uint32, uint32)
 	cifVoid3         types.CallInterface // void fn(uint32, uint32, uint32)
@@ -45,6 +47,7 @@ var (
 	cifVoid9TexImg   types.CallInterface // void fn(uint32, int32, int32, int32, int32, int32, uint32, uint32, void*)
 	cifVoid4Draw     types.CallInterface // void fn(uint32, int32, int32, int32)
 	cifVoid5DrawElem types.CallInterface // void fn(uint32, int32, uint32, void*, int32)
+	cifVoid6DrawBase types.CallInterface // void fn(uint32, int32, uint32, void*, int32, int32)
 	cifPtr1          types.CallInterface // void* fn(uint32)
 	cifPtr2UU        types.CallInterface // void* fn(uint32, uint32)
 	cifVoid7ReadPx   types.CallInterface // void fn(int32, int32, int32, int32, uint32, uint32, void*)
@@ -53,6 +56,8 @@ var (
 	cifVoid3UUF      types.CallInterface // void fn(uint32, uint32, float32) - SamplerParameterf
 	cifVoid1Float    types.CallInterface // void fn(float32) - ClearDepthf
 	cifVoid2Float    types.CallInterface // void fn(float32, float32) - DepthRangef
+	cifVoid1Double   types.CallInterface // void fn(float64) - ClearDepth
+	cifVoid2Double   types.CallInterface // void fn(float64, float64) - DepthRange
 	cifInitialized   bool
 )
 
@@ -90,6 +95,14 @@ func initCommonCallInterfaces() error {
 	err = ffi.PrepareCallInterface(&cifVoid1, types.DefaultCall,
 		types.VoidTypeDescriptor,
 		[]*types.TypeDescriptor{types.UInt32TypeDescriptor})
+	if err != nil {
+		return err
+	}
+
+	// void fn(void*) — GLsync is an opaque pointer, not a GLuint.
+	err = ffi.PrepareCallInterface(&cifVoid1Ptr, types.DefaultCall,
+		types.VoidTypeDescriptor,
+		[]*types.TypeDescriptor{types.PointerTypeDescriptor})
 	if err != nil {
 		return err
 	}
@@ -135,6 +148,20 @@ func initCommonCallInterfaces() error {
 			types.FloatTypeDescriptor,
 			types.FloatTypeDescriptor,
 		})
+	if err != nil {
+		return err
+	}
+
+	// Desktop GL depth functions take doubles, unlike the GLES float variants.
+	err = ffi.PrepareCallInterface(&cifVoid1Double, types.DefaultCall,
+		types.VoidTypeDescriptor,
+		[]*types.TypeDescriptor{types.DoubleTypeDescriptor})
+	if err != nil {
+		return err
+	}
+	err = ffi.PrepareCallInterface(&cifVoid2Double, types.DefaultCall,
+		types.VoidTypeDescriptor,
+		[]*types.TypeDescriptor{types.DoubleTypeDescriptor, types.DoubleTypeDescriptor})
 	if err != nil {
 		return err
 	}
@@ -340,6 +367,21 @@ func initCommonCallInterfaces() error {
 		return err
 	}
 
+	// DrawElementsInstancedBaseVertex includes both instance count and base vertex.
+	err = ffi.PrepareCallInterface(&cifVoid6DrawBase, types.DefaultCall,
+		types.VoidTypeDescriptor,
+		[]*types.TypeDescriptor{
+			types.UInt32TypeDescriptor,
+			types.SInt32TypeDescriptor,
+			types.UInt32TypeDescriptor,
+			types.PointerTypeDescriptor,
+			types.SInt32TypeDescriptor,
+			types.SInt32TypeDescriptor,
+		})
+	if err != nil {
+		return err
+	}
+
 	// void fn(int32, int32, int32, int32, uint32, uint32, void*) - ReadPixels
 	err = ffi.PrepareCallInterface(&cifVoid7ReadPx, types.DefaultCall,
 		types.VoidTypeDescriptor,
@@ -412,20 +454,22 @@ type Context struct {
 	isGLES bool
 
 	// Core GL 1.1
-	glGetError     unsafe.Pointer
-	glGetString    unsafe.Pointer
-	glGetIntegerv  unsafe.Pointer
-	glEnable       unsafe.Pointer
-	glDisable      unsafe.Pointer
-	glClear        unsafe.Pointer
-	glClearColor   unsafe.Pointer
-	glClearDepth   unsafe.Pointer
-	glViewport     unsafe.Pointer
-	glScissor      unsafe.Pointer
-	glDrawArrays   unsafe.Pointer
-	glDrawElements unsafe.Pointer
-	glFlush        unsafe.Pointer
-	glFinish       unsafe.Pointer
+	glGetError                        unsafe.Pointer
+	glGetString                       unsafe.Pointer
+	glGetIntegerv                     unsafe.Pointer
+	glEnable                          unsafe.Pointer
+	glDisable                         unsafe.Pointer
+	glClear                           unsafe.Pointer
+	glClearColor                      unsafe.Pointer
+	glClearDepth                      unsafe.Pointer
+	glViewport                        unsafe.Pointer
+	glScissor                         unsafe.Pointer
+	glDrawArrays                      unsafe.Pointer
+	glDrawElements                    unsafe.Pointer
+	glDrawElementsBaseVertex          unsafe.Pointer
+	glDrawElementsInstancedBaseVertex unsafe.Pointer
+	glFlush                           unsafe.Pointer
+	glFinish                          unsafe.Pointer
 
 	// Shaders (GL 2.0+)
 	glCreateShader       unsafe.Pointer
@@ -778,7 +822,51 @@ func (c *Context) Load(getProcAddr ProcAddressFunc, isGLES ...bool) error {
 	// Indexed string query (GL 3.0+ / ES 3.0+)
 	c.glGetStringi = getProcAddr("glGetStringi")
 
-	return nil
+	return c.loadBaseVertexFunctions(getProcAddr)
+}
+
+// EGL can return non-nil dispatch stubs for functions the current context does
+// not support. Select entry points from the actual version/extensions first.
+func (c *Context) loadBaseVertexFunctions(getProcAddr ProcAddressFunc) error {
+	c.glDrawElementsBaseVertex = nil
+	c.glDrawElementsInstancedBaseVertex = nil
+	const majorVersion, minorVersion = 0x821B, 0x821C
+	var major, minor, extensionCount int32
+	c.GetIntegerv(majorVersion, &major)
+	c.GetIntegerv(minorVersion, &minor)
+	c.GetIntegerv(NUM_EXTENSIONS, &extensionCount)
+	hasExtension := func(name string) bool {
+		for i := int32(0); i < extensionCount; i++ {
+			if c.GetStringi(EXTENSIONS, uint32(i)) == name {
+				return true
+			}
+		}
+		return false
+	}
+	var suffixes []string
+	if major > 3 || major == 3 && minor >= 2 {
+		suffixes = append(suffixes, "")
+	}
+	if c.isGLES {
+		if hasExtension("GL_OES_draw_elements_base_vertex") {
+			suffixes = append(suffixes, "OES")
+		}
+		if hasExtension("GL_EXT_draw_elements_base_vertex") {
+			suffixes = append(suffixes, "EXT")
+		}
+	} else if hasExtension("GL_ARB_draw_elements_base_vertex") && len(suffixes) == 0 {
+		suffixes = append(suffixes, "") // ARB uses the core function names.
+	}
+	for _, suffix := range suffixes {
+		draw := getProcAddr("glDrawElementsBaseVertex" + suffix)
+		instanced := getProcAddr("glDrawElementsInstancedBaseVertex" + suffix)
+		if draw != nil && instanced != nil {
+			c.glDrawElementsBaseVertex = draw
+			c.glDrawElementsInstancedBaseVertex = instanced
+			return nil
+		}
+	}
+	return fmt.Errorf("gles: base-vertex drawing unavailable (GL %d.%d, ES=%t): need core 3.2+ or a supported draw_elements_base_vertex extension", major, minor, c.isGLES)
 }
 
 // --- GL Function Wrappers ---
@@ -853,18 +941,26 @@ func (c *Context) ClearColor(r, g, b, a float32) {
 }
 
 // ClearDepth sets the depth value used by glClear(GL_DEPTH_BUFFER_BIT).
-// On GLES the loaded function is glClearDepthf (float32).
-// On desktop GL it is glClearDepth (double) — but Linux GLES contexts always
-// load glClearDepthf, so we pass float32 unconditionally.
+// Desktop GL takes a double; GLES takes a float via glClearDepthf.
 func (c *Context) ClearDepth(depth float64) {
+	if !c.isGLES {
+		args := [1]unsafe.Pointer{unsafe.Pointer(&depth)}
+		_, _ = ffi.CallFunction(&cifVoid1Double, c.glClearDepth, nil, args[:])
+		return
+	}
 	d := float32(depth)
 	args := [1]unsafe.Pointer{unsafe.Pointer(&d)}
 	_, _ = ffi.CallFunction(&cifVoid1Float, c.glClearDepth, nil, args[:])
 }
 
 // DepthRange sets the mapping of NDC depth to window depth.
-// On GLES the loaded function is glDepthRangef (float32).
+// Desktop GL takes doubles; GLES takes floats via glDepthRangef.
 func (c *Context) DepthRange(near, far float64) {
+	if !c.isGLES {
+		args := [2]unsafe.Pointer{unsafe.Pointer(&near), unsafe.Pointer(&far)}
+		_, _ = ffi.CallFunction(&cifVoid2Double, c.glDepthRange, nil, args[:])
+		return
+	}
 	n, f := float32(near), float32(far)
 	args := [2]unsafe.Pointer{unsafe.Pointer(&n), unsafe.Pointer(&f)}
 	_, _ = ffi.CallFunction(&cifVoid2Float, c.glDepthRange, nil, args[:])
@@ -922,6 +1018,24 @@ func (c *Context) DrawElements(mode uint32, count int32, typ uint32, indices uin
 		unsafe.Pointer(&indices),
 	}
 	_, _ = ffi.CallFunction(&cifVoid4, c.glDrawElements, nil, args[:])
+}
+
+// DrawElementsBaseVertex adds baseVertex to each index, allowing multiple
+// meshes to share a vertex buffer without rebinding vertex attributes.
+func (c *Context) DrawElementsBaseVertex(mode uint32, count int32, typ uint32, indices uintptr, baseVertex int32) {
+	args := [5]unsafe.Pointer{
+		unsafe.Pointer(&mode), unsafe.Pointer(&count), unsafe.Pointer(&typ),
+		unsafe.Pointer(&indices), unsafe.Pointer(&baseVertex),
+	}
+	_, _ = ffi.CallFunction(&cifVoid5DrawElem, c.glDrawElementsBaseVertex, nil, args[:])
+}
+
+func (c *Context) DrawElementsInstancedBaseVertex(mode uint32, count int32, typ uint32, indices uintptr, instanceCount, baseVertex int32) {
+	args := [6]unsafe.Pointer{
+		unsafe.Pointer(&mode), unsafe.Pointer(&count), unsafe.Pointer(&typ),
+		unsafe.Pointer(&indices), unsafe.Pointer(&instanceCount), unsafe.Pointer(&baseVertex),
+	}
+	_, _ = ffi.CallFunction(&cifVoid6DrawBase, c.glDrawElementsInstancedBaseVertex, nil, args[:])
 }
 
 func (c *Context) Flush() {
@@ -1954,7 +2068,7 @@ func (c *Context) DeleteSync(sync uintptr) {
 		return
 	}
 	args := [1]unsafe.Pointer{unsafe.Pointer(&sync)}
-	_, _ = ffi.CallFunction(&cifVoid1, c.glDeleteSync, nil, args[:])
+	_, _ = ffi.CallFunction(&cifVoid1Ptr, c.glDeleteSync, nil, args[:])
 }
 
 // ClientWaitSync blocks until the sync object is signaled or timeout expires.

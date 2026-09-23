@@ -17,6 +17,30 @@ import (
 	"github.com/gogpu/wgpu/hal/gles/gl"
 )
 
+// buildSamplerBindMap includes both shader stages: a sampler may be used only
+// by the vertex shader, or shared by vertex and fragment textures.
+func buildSamplerBindMap(layout *PipelineLayout, stages ...glsl.TranslationInfo) [maxTextureSlots]int8 {
+	var mapping [maxTextureSlots]int8
+	for i := range mapping {
+		mapping[i] = -1
+	}
+	for _, stage := range stages {
+		for _, tm := range stage.TextureMappings {
+			if tm.SamplerBinding == nil {
+				continue
+			}
+			texKey := glsl.BindingMapKey{Group: tm.TextureBinding.Group, Binding: tm.TextureBinding.Binding}
+			samplerKey := glsl.BindingMapKey{Group: tm.SamplerBinding.Group, Binding: tm.SamplerBinding.Binding}
+			texUnit, texOK := layout.bindingMap[texKey]
+			samplerUnit, samplerOK := layout.bindingMap[samplerKey]
+			if texOK && samplerOK && texUnit < maxTextureSlots {
+				mapping[texUnit] = int8(samplerUnit)
+			}
+		}
+	}
+	return mapping
+}
+
 // compileWGSLToGLSL compiles a WGSL shader source to GLSL for the given entry point.
 // OpenGL does not understand WGSL, so we use naga to parse WGSL and emit GLSL.
 //

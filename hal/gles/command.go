@@ -6,7 +6,6 @@
 package gles
 
 import (
-	"context"
 	"log/slog"
 	"unsafe"
 
@@ -464,14 +463,16 @@ func (e *CommandEncoder) emitTimestamp(querySet hal.QuerySet, index *uint32) {
 
 // RenderPassEncoder implements hal.RenderPassEncoder for OpenGL.
 type RenderPassEncoder struct {
-	encoder       *CommandEncoder
-	desc          *hal.RenderPassDescriptor
-	pipeline      *RenderPipeline
-	vertexBuffers []*Buffer
-	indexBuffer   *Buffer
-	indexFormat   gputypes.IndexFormat
-	stencilRef    uint32
-	fbHeight      uint32 // Framebuffer height for MSAA resolve blit Y-flip
+	encoder             *CommandEncoder
+	desc                *hal.RenderPassDescriptor
+	pipeline            *RenderPipeline
+	vertexBuffers       []*Buffer
+	vertexBufferOffsets []uint64
+	indexBuffer         *Buffer
+	indexBufferOffset   uint64
+	indexFormat         gputypes.IndexFormat
+	stencilRef          uint32
+	fbHeight            uint32 // Framebuffer height for MSAA resolve blit Y-flip
 
 	// MSAA resolve state: set during BeginRenderPass when ResolveTarget is present.
 	msaaTexture      *Texture // The MSAA color texture (source for resolve)
@@ -566,6 +567,20 @@ func (e *RenderPassEncoder) SetPipeline(pipeline hal.RenderPipeline) {
 			stencilRef:   e.stencilRef,
 		},
 	)
+	// WebGPU allows buffers to be bound before the pipeline and preserves them
+	// across pipeline changes. GL vertex attributes depend on the pipeline's
+	// layout, so restore each bound buffer with the newly selected layout.
+	for slot, buffer := range e.vertexBuffers {
+		if buffer == nil || slot >= len(p.vertexBuffers) {
+			continue
+		}
+		e.encoder.commands = append(e.encoder.commands, &SetVertexBufferCommand{
+			slot:   uint32(slot),
+			buffer: buffer,
+			offset: e.vertexBufferOffsets[slot],
+			layout: &p.vertexBuffers[slot],
+		})
+	}
 }
 
 // SetBindGroup sets a bind group.
@@ -605,8 +620,10 @@ func (e *RenderPassEncoder) SetVertexBuffer(slot uint32, buffer hal.Buffer, offs
 	// Grow slice if needed
 	for len(e.vertexBuffers) <= int(slot) {
 		e.vertexBuffers = append(e.vertexBuffers, nil)
+		e.vertexBufferOffsets = append(e.vertexBufferOffsets, 0)
 	}
 	e.vertexBuffers[slot] = buf
+	e.vertexBufferOffsets[slot] = offset
 
 	// Get vertex layout from the current pipeline for this slot.
 	var layout *gputypes.VertexBufferLayout
@@ -629,6 +646,7 @@ func (e *RenderPassEncoder) SetIndexBuffer(buffer hal.Buffer, format gputypes.In
 		return
 	}
 	e.indexBuffer = buf
+	e.indexBufferOffset = offset
 	e.indexFormat = format
 
 	e.encoder.commands = append(e.encoder.commands, &SetIndexBufferCommand{
@@ -699,13 +717,14 @@ func (e *RenderPassEncoder) DrawIndexed(args gputypes.DrawIndexedArgs) {
 		topology = e.pipeline.primitiveTopology
 	}
 	e.encoder.commands = append(e.encoder.commands, &DrawIndexedCommand{
-		indexCount:    args.IndexCount,
-		instanceCount: args.InstanceCount,
-		firstIndex:    args.FirstIndex,
-		baseVertex:    args.BaseVertex,
-		firstInstance: args.FirstInstance,
-		indexFormat:   e.indexFormat,
-		topology:      topology,
+		indexCount:        args.IndexCount,
+		instanceCount:     args.InstanceCount,
+		firstIndex:        args.FirstIndex,
+		baseVertex:        args.BaseVertex,
+		firstInstance:     args.FirstInstance,
+		indexFormat:       e.indexFormat,
+		indexBufferOffset: e.indexBufferOffset,
+		topology:          topology,
 	})
 }
 
@@ -1322,20 +1341,7 @@ func (c *SetBindGroupCommand) Execute(ctx *gl.Context) {
 			if samplerID == 0 {
 				continue
 			}
-			// Determine the correct texture unit for this sampler.
-			// Naga GLSL generates combined sampler2D on the texture's binding,
-			// so the sampler must be bound to the texture's unit — NOT the
-			// sampler's own WGSL binding. SamplerBindMap provides this mapping.
-			// Matches Rust wgpu-hal GLES SamplerBindMap (command.rs:247).
-			bindUnit := c.resolveSamplerUnit(glBinding)
-			if hal.Logger().Enabled(context.Background(), slog.LevelDebug) {
-				hal.Logger().Debug("gles: binding sampler",
-					"samplerBinding", glBinding,
-					"textureUnit", bindUnit,
-					"samplerID", samplerID,
-				)
-			}
-			ctx.BindSampler(bindUnit, samplerID)
+			c.bindSampler(ctx, glBinding, samplerID)
 		}
 	}
 }
@@ -1352,17 +1358,18 @@ func (c *SetBindGroupCommand) lookupSlot(binding uint32) uint32 {
 	return 0xFF
 }
 
-// resolveSamplerUnit finds the texture unit for a sampler via SamplerBindMap.
-func (c *SetBindGroupCommand) resolveSamplerUnit(glBinding uint32) uint32 {
+// bindSampler applies a shared WGSL sampler to every texture using it. A world
+// shader can sample both its base texture and its lightmap with the same sampler.
+func (c *SetBindGroupCommand) bindSampler(ctx *gl.Context, glBinding, samplerID uint32) {
 	if c.samplerBindMap == nil {
-		return glBinding
+		ctx.BindSampler(glBinding, samplerID)
+		return
 	}
 	for texUnit := range c.samplerBindMap {
 		if c.samplerBindMap[texUnit] == int8(glBinding) {
-			return uint32(texUnit)
+			ctx.BindSampler(uint32(texUnit), samplerID)
 		}
 	}
-	return glBinding
 }
 
 // resolveBufferTarget determines the GL buffer target (UNIFORM_BUFFER or SHADER_STORAGE_BUFFER)
@@ -1522,6 +1529,7 @@ type DrawIndexedCommand struct {
 	baseVertex                int32
 	firstInstance             uint32
 	indexFormat               gputypes.IndexFormat
+	indexBufferOffset         uint64
 	topology                  gputypes.PrimitiveTopology
 }
 
@@ -1533,13 +1541,21 @@ func (c *DrawIndexedCommand) Execute(ctx *gl.Context) {
 		indexSize = 4
 	}
 
-	offset := uintptr(c.firstIndex) * indexSize
+	offset := uintptr(c.indexBufferOffset) + uintptr(c.firstIndex)*indexSize
 	mode := primitiveTopologyToGL(c.topology)
 
 	if c.instanceCount <= 1 {
-		ctx.DrawElements(mode, int32(c.indexCount), indexType, offset)
+		if c.baseVertex != 0 {
+			ctx.DrawElementsBaseVertex(mode, int32(c.indexCount), indexType, offset, c.baseVertex)
+		} else {
+			ctx.DrawElements(mode, int32(c.indexCount), indexType, offset)
+		}
 	} else {
-		ctx.DrawElementsInstanced(mode, int32(c.indexCount), indexType, offset, int32(c.instanceCount))
+		if c.baseVertex != 0 {
+			ctx.DrawElementsInstancedBaseVertex(mode, int32(c.indexCount), indexType, offset, int32(c.instanceCount), c.baseVertex)
+		} else {
+			ctx.DrawElementsInstanced(mode, int32(c.indexCount), indexType, offset, int32(c.instanceCount))
+		}
 	}
 }
 

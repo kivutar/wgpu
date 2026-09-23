@@ -6,6 +6,7 @@
 package gl
 
 import (
+	"errors"
 	"syscall"
 	"unsafe"
 )
@@ -15,20 +16,22 @@ import (
 // directly from opengl32.dll for GL 1.1 functions.
 type Context struct {
 	// Core GL 1.1 (from opengl32.dll)
-	glGetError     uintptr
-	glGetString    uintptr
-	glGetIntegerv  uintptr
-	glEnable       uintptr
-	glDisable      uintptr
-	glClear        uintptr
-	glClearColor   uintptr
-	glClearDepth   uintptr
-	glViewport     uintptr
-	glScissor      uintptr
-	glDrawArrays   uintptr
-	glDrawElements uintptr
-	glFlush        uintptr
-	glFinish       uintptr
+	glGetError                        uintptr
+	glGetString                       uintptr
+	glGetIntegerv                     uintptr
+	glEnable                          uintptr
+	glDisable                         uintptr
+	glClear                           uintptr
+	glClearColor                      uintptr
+	glClearDepth                      uintptr
+	glViewport                        uintptr
+	glScissor                         uintptr
+	glDrawArrays                      uintptr
+	glDrawElements                    uintptr
+	glDrawElementsBaseVertex          uintptr
+	glDrawElementsInstancedBaseVertex uintptr
+	glFlush                           uintptr
+	glFinish                          uintptr
 
 	// Shaders (GL 2.0+)
 	glCreateShader       uintptr
@@ -197,6 +200,8 @@ func (c *Context) Load(getProcAddr ProcAddressFunc) error {
 	c.glScissor = getProcAddr("glScissor")
 	c.glDrawArrays = getProcAddr("glDrawArrays")
 	c.glDrawElements = getProcAddr("glDrawElements")
+	c.glDrawElementsBaseVertex = getProcAddr("glDrawElementsBaseVertex")
+	c.glDrawElementsInstancedBaseVertex = getProcAddr("glDrawElementsInstancedBaseVertex")
 	c.glFlush = getProcAddr("glFlush")
 	c.glFinish = getProcAddr("glFinish")
 
@@ -348,6 +353,10 @@ func (c *Context) Load(getProcAddr ProcAddressFunc) error {
 	// Indexed string query (GL 3.0+ / ES 3.0+)
 	c.glGetStringi = getProcAddr("glGetStringi")
 
+	// WGL requests desktop GL 3.3+, where these functions are mandatory.
+	if c.glDrawElementsBaseVertex == 0 || c.glDrawElementsInstancedBaseVertex == 0 {
+		return errors.New("gles: required base-vertex draw functions are unavailable")
+	}
 	return nil
 }
 
@@ -433,6 +442,14 @@ func (c *Context) DrawArrays(mode uint32, first, count int32) {
 
 func (c *Context) DrawElements(mode uint32, count int32, typ uint32, indices uintptr) {
 	syscall.SyscallN(c.glDrawElements, uintptr(mode), uintptr(count), uintptr(typ), indices)
+}
+
+func (c *Context) DrawElementsBaseVertex(mode uint32, count int32, typ uint32, indices uintptr, baseVertex int32) {
+	syscall.SyscallN(c.glDrawElementsBaseVertex, uintptr(mode), uintptr(count), uintptr(typ), indices, uintptr(baseVertex))
+}
+
+func (c *Context) DrawElementsInstancedBaseVertex(mode uint32, count int32, typ uint32, indices uintptr, instanceCount, baseVertex int32) {
+	syscall.SyscallN(c.glDrawElementsInstancedBaseVertex, uintptr(mode), uintptr(count), uintptr(typ), indices, uintptr(instanceCount), uintptr(baseVertex))
 }
 
 func (c *Context) Flush() {
