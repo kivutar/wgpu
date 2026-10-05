@@ -512,6 +512,7 @@ type RenderPassEncoder struct {
 	pipeline           *RenderPipeline
 	indexFormat        gputypes.IndexFormat
 	descriptorHeapsSet bool // Tracks whether descriptor heaps have been bound
+	vertexBuffers      []d3d12.D3D12_VERTEX_BUFFER_VIEW
 
 	// endOfPassTimerQuery stores the query heap and index for the end-of-pass
 	// timestamp write. Set during BeginRenderPass, consumed in End().
@@ -619,6 +620,20 @@ func (e *RenderPassEncoder) SetPipeline(pipeline hal.RenderPipeline) {
 	}
 	e.encoder.cmdList.IASetPrimitiveTopology(p.topology)
 
+	// WebGPU allows buffers to be bound before the pipeline. D3D12 stores
+	// the stride in each buffer view, so refresh it when the pipeline changes.
+	for slot, stride := range p.vertexStrides {
+		if slot >= len(e.vertexBuffers) {
+			break
+		}
+		view := &e.vertexBuffers[slot]
+		if view.BufferLocation == 0 || view.StrideInBytes == stride {
+			continue
+		}
+		view.StrideInBytes = stride
+		e.encoder.cmdList.IASetVertexBuffers(uint32(slot), 1, view)
+	}
+
 	// Bind the global sampler descriptor heap to the sampler root parameter.
 	// This is the ONE root parameter that covers all 2048+2048 sampler slots.
 	if p.samplerRootIndex >= 0 && e.encoder.device.samplerHeap != nil {
@@ -688,6 +703,10 @@ func (e *RenderPassEncoder) SetVertexBuffer(slot uint32, buffer hal.Buffer, offs
 		StrideInBytes:  stride,
 	}
 
+	if int(slot) >= len(e.vertexBuffers) {
+		e.vertexBuffers = append(e.vertexBuffers, make([]d3d12.D3D12_VERTEX_BUFFER_VIEW, int(slot)+1-len(e.vertexBuffers))...)
+	}
+	e.vertexBuffers[slot] = vbv
 	e.encoder.cmdList.IASetVertexBuffers(slot, 1, &vbv)
 }
 
