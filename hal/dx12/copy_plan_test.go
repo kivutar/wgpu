@@ -6,11 +6,107 @@
 package dx12
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/gogpu/gputypes"
 	"github.com/gogpu/wgpu/hal"
 )
+
+// Texture uploads share staging chunks with uniform and vertex writes, so a
+// legal source offset need not start a native 512-byte footprint or row.
+func TestPlanBufferTextureCopiesCoversUnalignedRows(t *testing.T) {
+	for _, format := range []gputypes.TextureFormat{
+		gputypes.TextureFormatRGBA8Unorm,
+		gputypes.TextureFormatBC1RGBAUnorm,
+	} {
+		info, _ := textureBlockInfoForFormat(format)
+		for _, widthBlocks := range []uint32{1, 16, 32, 63, 64, 65, 96, 128, 192} {
+			pitch := (widthBlocks*info.bytes + 255) &^ 255
+			for offset := uint64(0); offset < 1024; offset += uint64(info.bytes) {
+				t.Run(fmt.Sprintf("%v/width=%d/offset=%d", format, widthBlocks, offset), func(t *testing.T) {
+					const rows = 3
+					const layers = 2
+					texture := testTexture(format, gputypes.TextureDimension2D, widthBlocks*info.width+8, rows*info.height+8, layers, 1)
+					origin := hal.Origin3D{X: 4, Y: 4}
+					layout := hal.ImageDataLayout{Offset: offset, BytesPerRow: pitch, RowsPerImage: (rows + 1) * info.height}
+					plans := planBufferTextureCopies(texture, hal.ImageCopyTexture{Origin: origin, Aspect: gputypes.TextureAspectAll}, layout, hal.Extent3D{Width: widthBlocks * info.width, Height: rows * info.height, DepthOrArrayLayers: layers})
+					if len(plans) < layers || len(plans) > 2*layers {
+						t.Fatalf("got %d plans, want one or two per layer", len(plans))
+					}
+					covered := make([]bool, layers*rows*widthBlocks)
+					for _, plan := range plans {
+						if plan.bufferOffset%512 != 0 || plan.rowPitch != pitch || plan.footprintWidth/info.width*info.bytes > pitch {
+							t.Fatalf("invalid native footprint: %+v", plan)
+						}
+						if plan.bufferOriginX+plan.copyWidth > plan.footprintWidth || plan.bufferOriginY+plan.copyHeight > plan.footprintHeight {
+							t.Fatalf("copy exceeds footprint: %+v", plan)
+						}
+						for y := uint32(0); y < plan.copyHeight/info.height; y++ {
+							for x := uint32(0); x < plan.copyWidth/info.width; x++ {
+								dstX := (plan.textureOriginX-origin.X)/info.width + x
+								dstY := (plan.textureOriginY-origin.Y)/info.height + y
+								layer := plan.subresource
+								if dstX >= widthBlocks || dstY >= rows || layer >= layers {
+									t.Fatalf("copy exceeds texture region: %+v", plan)
+								}
+								idx := (layer*rows+dstY)*widthBlocks + dstX
+								if covered[idx] {
+									t.Fatalf("block %d copied twice", idx)
+								}
+								covered[idx] = true
+								got := plan.bufferOffset + uint64(plan.bufferOriginY/info.height+y)*uint64(pitch) + uint64(plan.bufferOriginX/info.width+x)*uint64(info.bytes)
+								want := offset + uint64(layer*(rows+1)+dstY)*uint64(pitch) + uint64(dstX)*uint64(info.bytes)
+								if got != want {
+									t.Fatalf("source address = %d, want %d", got, want)
+								}
+							}
+						}
+					}
+					for i, copied := range covered {
+						if !copied {
+							t.Fatalf("block %d was silently skipped (%d plans)", i, len(plans))
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestPlanBufferTextureCopiesSplitPreservesMipAndDepth(t *testing.T) {
+	for _, dimension := range []gputypes.TextureDimension{gputypes.TextureDimension2D, gputypes.TextureDimension3D} {
+		t.Run(fmt.Sprint(dimension), func(t *testing.T) {
+			texture := testTexture(gputypes.TextureFormatRGBA8Unorm, dimension, 256, 32, 8, 3)
+			region := hal.ImageCopyTexture{MipLevel: 1, Origin: hal.Origin3D{X: 8, Y: 4, Z: 1}, Aspect: gputypes.TextureAspectAll}
+			layout := hal.ImageDataLayout{Offset: 4, BytesPerRow: 256, RowsPerImage: 5}
+			plans := planBufferTextureCopies(texture, region, layout, hal.Extent3D{Width: 64, Height: 3, DepthOrArrayLayers: 2})
+			if len(plans) != 4 {
+				t.Fatalf("got %d plans, want two strips per slice", len(plans))
+			}
+			for i, plan := range plans {
+				slice := uint32(i / 2)
+				column, width := uint32(0), uint32(63)
+				if i%2 != 0 {
+					column, width = 63, 1
+				}
+				subresource := texture.subresourceIndex(1, 1+slice)
+				z := uint32(0)
+				if dimension == gputypes.TextureDimension3D {
+					subresource, z = 1, 1+slice
+				}
+				if plan.subresource != subresource || plan.textureOriginX != 8+column || plan.textureOriginY != 4 || plan.textureOriginZ != z || plan.copyWidth != width || plan.copyHeight != 3 {
+					t.Fatalf("strip %d targets the wrong texture region: %+v", i, plan)
+				}
+				got := plan.bufferOffset + uint64(plan.bufferOriginY)*256 + uint64(plan.bufferOriginX)*4
+				want := uint64(4 + slice*5*256 + column*4)
+				if got != want {
+					t.Fatalf("strip %d buffer offset = %d, want %d", i, got, want)
+				}
+			}
+		})
+	}
+}
 
 func testTexture(format gputypes.TextureFormat, dimension gputypes.TextureDimension, width, height, depth, mips uint32) *Texture {
 	return &Texture{format: format, dimension: dimension, size: hal.Extent3D{Width: width, Height: height, DepthOrArrayLayers: depth}, mipLevels: mips}

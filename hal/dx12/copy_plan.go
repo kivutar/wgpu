@@ -256,8 +256,8 @@ func writeTextureNativeLayout(texture *Texture, layout hal.ImageDataLayout, size
 	return info, nativeLayout, sourceBytesPerRow, sourceBlockRows, true
 }
 
-// planBufferTextureCopies converts a WebGPU buffer/texture copy into one plan
-// per D3D12 subresource or 3D depth slice. It returns nil when the layout
+// planBufferTextureCopies converts a WebGPU buffer/texture copy into one or
+// two plans per D3D12 subresource or 3D depth slice. It returns nil when the layout
 // cannot be represented without changing logical byte addresses.
 func planBufferTextureCopies(texture *Texture, region hal.ImageCopyTexture, layout hal.ImageDataLayout, size hal.Extent3D) []bufferTextureCopyPlan {
 	info, rowPitch, blockRows, ok := normalizedCopyLayout(texture, layout, size)
@@ -293,33 +293,52 @@ func planBufferTextureCopies(texture *Texture, region hal.ImageCopyTexture, layo
 			if logicalOffset < layout.Offset {
 				return nil
 			}
-			placed, representable := planPlacedBufferSlice(
-				logicalOffset, rowPitch, info.width, info.height, info.bytes,
-				widthBlocks*info.width, heightBlocks*info.height)
-			if !representable {
-				return nil
-			}
 			subresource := texture.subresourceIndexForPlane(region.MipLevel, 0, plane)
 			textureOriginZ := region.Origin.Z + slice
 			if texture.dimension != gputypes.TextureDimension3D {
 				subresource = texture.subresourceIndexForPlane(region.MipLevel, region.Origin.Z+slice, plane)
 				textureOriginZ = 0
 			}
-			plans = append(plans, bufferTextureCopyPlan{
-				subresource:     subresource,
-				bufferOffset:    placed.bufferOffset,
-				bufferOriginX:   placed.bufferOriginX,
-				bufferOriginY:   placed.bufferOriginY,
-				footprintWidth:  placed.footprintWidth,
-				footprintHeight: placed.footprintHeight,
-				footprintDepth:  1,
-				textureOriginX:  region.Origin.X,
-				textureOriginY:  region.Origin.Y,
-				textureOriginZ:  textureOriginZ,
-				rowPitch:        rowPitch,
-				copyWidth:       widthBlocks * info.width,
-				copyHeight:      heightBlocks * info.height,
-			})
+			// A WebGPU buffer offset only needs block alignment. Aligning the
+			// native footprint down to 512 bytes can place the first block partway
+			// through a row. Split at that row boundary instead of dropping a valid
+			// copy whose width no longer fits in one footprint. The second strip
+			// begins in the next buffer row, but at the same texture Y coordinate.
+			for column := uint32(0); column < widthBlocks; {
+				columnBytes := uint64(column) * uint64(info.bytes)
+				if logicalOffset > math.MaxUint64-columnBytes {
+					return nil
+				}
+				copyOffset := logicalOffset + columnBytes
+				placed, representable := planPlacedBufferSlice(
+					copyOffset, rowPitch, info.width, info.height, info.bytes,
+					info.width, heightBlocks*info.height)
+				if !representable {
+					return nil
+				}
+				stripBlocks := min(widthBlocks-column, rowPitch/info.bytes-placed.bufferOriginX/info.width)
+				copyWidth := stripBlocks * info.width
+				if stripBlocks == 0 || placed.bufferOriginX > math.MaxUint32-copyWidth {
+					return nil
+				}
+				placed.footprintWidth = placed.bufferOriginX + copyWidth
+				plans = append(plans, bufferTextureCopyPlan{
+					subresource:     subresource,
+					bufferOffset:    placed.bufferOffset,
+					bufferOriginX:   placed.bufferOriginX,
+					bufferOriginY:   placed.bufferOriginY,
+					footprintWidth:  placed.footprintWidth,
+					footprintHeight: placed.footprintHeight,
+					footprintDepth:  1,
+					textureOriginX:  region.Origin.X + column*info.width,
+					textureOriginY:  region.Origin.Y,
+					textureOriginZ:  textureOriginZ,
+					rowPitch:        rowPitch,
+					copyWidth:       copyWidth,
+					copyHeight:      heightBlocks * info.height,
+				})
+				column += stripBlocks
+			}
 		}
 	}
 	return plans
