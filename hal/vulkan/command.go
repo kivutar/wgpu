@@ -532,6 +532,7 @@ func (e *CommandEncoder) TransitionTextures(barriers []hal.TextureBarrier) {
 		}
 
 		srcAccess, srcStage, oldLayout := textureUsageToAccessStageLayout(b.Usage.OldUsage)
+		oldLayout = textureTransitionSourceLayout(tex, b.Usage.OldUsage, oldLayout)
 		dstAccess, dstStage, newLayout := textureUsageToAccessStageLayout(b.Usage.NewUsage)
 
 		imageBarriers = append(imageBarriers, vk.ImageMemoryBarrier{
@@ -1838,4 +1839,13 @@ func vkCmdDispatchIndirect(cmds *vk.Commands, cmdBuffer vk.CommandBuffer, buffer
 
 func vkCmdCopyQueryPoolResults(cmds *vk.Commands, cmdBuffer vk.CommandBuffer, queryPool vk.QueryPool, firstQuery, queryCount uint32, dstBuffer vk.Buffer, dstOffset, stride uint64, flags vk.QueryResultFlags) {
 	cmds.CmdCopyQueryPoolResults(cmdBuffer, queryPool, firstQuery, queryCount, dstBuffer, dstOffset, stride, flags)
+}
+
+// textureTransitionSourceLayout accounts for automatic render-pass final
+// transitions. Access masks still come from usage, preserving write visibility.
+func textureTransitionSourceLayout(tex *Texture, usage gputypes.TextureUsage, layout vk.ImageLayout) vk.ImageLayout {
+	if usage == gputypes.TextureUsageRenderAttachment && !tex.format.IsDepthStencil() && tex.samples == 1 && tex.usage&gputypes.TextureUsageTextureBinding != 0 {
+		return vk.ImageLayoutGeneral
+	}
+	return layout
 }
