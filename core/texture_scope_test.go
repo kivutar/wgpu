@@ -106,6 +106,7 @@ func TestTexture_TrackerIndex_FreedAndReused(t *testing.T) {
 		1, 1, "ReuseTex1",
 	)
 	idx1 := tex1.TrackingData().Index()
+	device.Tracker().InsertTexture(idx1, track.TextureUsesCopySrc)
 	tex1.Destroy()
 
 	// Create a new texture — it should reuse the freed index.
@@ -120,6 +121,16 @@ func TestTexture_TrackerIndex_FreedAndReused(t *testing.T) {
 
 	if idx2 != idx1 {
 		t.Errorf("Freed index %d should be reused, got %d", idx1, idx2)
+	}
+	if device.Tracker().Textures().IsTracked(idx2) {
+		t.Fatal("new texture inherited the previous image's copy-source state")
+	}
+	scope := track.NewTextureUsageScope()
+	if err := scope.SetUsage(idx2, track.TextureUsesColorTarget); err != nil {
+		t.Fatal(err)
+	}
+	if transitions := device.Tracker().MergeTextureScope(scope); len(transitions) != 0 {
+		t.Fatalf("first use must not transition from a destroyed image's layout: %v", transitions)
 	}
 }
 

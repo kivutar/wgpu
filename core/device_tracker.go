@@ -3,6 +3,8 @@
 package core
 
 import (
+	"sync"
+
 	"github.com/gogpu/wgpu/core/track"
 	"github.com/gogpu/wgpu/hal"
 )
@@ -17,8 +19,10 @@ import (
 //
 // Reference: wgpu-core track/mod.rs DeviceTracker
 type DeviceTracker struct {
-	textures *track.TextureTracker
-	buffers  *track.BufferTracker
+	// Texture creation can recycle indices while the queue merges submissions.
+	textureMu sync.Mutex
+	textures  *track.TextureTracker
+	buffers   *track.BufferTracker
 }
 
 // NewDeviceTracker creates a device tracker with empty trackers.
@@ -29,7 +33,8 @@ func NewDeviceTracker() *DeviceTracker {
 	}
 }
 
-// Textures returns the device-level texture tracker.
+// Textures returns the device-level texture tracker. The caller must ensure
+// exclusive access; normal mutations should use the synchronized methods here.
 func (dt *DeviceTracker) Textures() *track.TextureTracker {
 	return dt.textures
 }
@@ -51,6 +56,8 @@ func (dt *DeviceTracker) MergeTextureScope(scope *track.TextureUsageScope) []tra
 	if scope == nil {
 		return nil
 	}
+	dt.textureMu.Lock()
+	defer dt.textureMu.Unlock()
 	return dt.textures.Merge(scope)
 }
 
@@ -90,7 +97,7 @@ func (dt *DeviceTracker) RemoveBuffer(index track.TrackerIndex) {
 func (dt *DeviceTracker) TrackPresentTexture(trackerIndex track.TrackerIndex) *track.TexturePendingTransition {
 	scope := track.NewTextureUsageScope()
 	_ = scope.SetUsage(trackerIndex, track.TextureUsesPresent)
-	transitions := dt.textures.Merge(scope)
+	transitions := dt.MergeTextureScope(scope)
 	if len(transitions) == 0 {
 		return nil
 	}
@@ -100,12 +107,16 @@ func (dt *DeviceTracker) TrackPresentTexture(trackerIndex track.TrackerIndex) *t
 // InsertTexture registers a texture in the device tracker with its initial
 // usage. Called when a texture is first used (e.g., acquired from swapchain).
 func (dt *DeviceTracker) InsertTexture(index track.TrackerIndex, usage track.TextureUses) {
+	dt.textureMu.Lock()
+	defer dt.textureMu.Unlock()
 	dt.textures.InsertSingle(index, usage)
 }
 
 // RemoveTexture removes a texture from the device tracker.
-// Called when a texture is destroyed.
+// Also used to reset recycled indices before a new texture can be submitted.
 func (dt *DeviceTracker) RemoveTexture(index track.TrackerIndex) {
+	dt.textureMu.Lock()
+	defer dt.textureMu.Unlock()
 	dt.textures.Remove(index)
 }
 

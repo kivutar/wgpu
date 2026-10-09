@@ -925,6 +925,11 @@ func NewTexture(
 	var td *track.TrackingData
 	if device != nil && device.TrackerIndices() != nil {
 		td = track.NewTrackingData(device.TrackerIndices().Textures())
+		// Recycled indices must not inherit a destroyed texture's last usage.
+		// A new image starts untracked; its first operation initializes it.
+		if tracker := device.Tracker(); tracker != nil {
+			tracker.RemoveTexture(td.Index())
+		}
 	} else {
 		td = track.NewTrackingData(nil)
 	}
