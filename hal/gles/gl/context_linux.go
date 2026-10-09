@@ -800,7 +800,14 @@ func (c *Context) Load(getProcAddr ProcAddressFunc, isGLES ...bool) error {
 	c.glMemoryBarrier = getProcAddr("glMemoryBarrier")
 
 	// MSAA (optional - may be nil on older GL versions)
-	c.glTexImage2DMultisample = getProcAddr("glTexImage2DMultisample")
+	if gles {
+		// ES uses immutable multisample storage; the desktop TexImage entry
+		// point can resolve to a stub that fails on an ES context. Both have
+		// the same signature, and each texture is allocated only once.
+		c.glTexImage2DMultisample = getProcAddr("glTexStorage2DMultisample")
+	} else {
+		c.glTexImage2DMultisample = getProcAddr("glTexImage2DMultisample")
+	}
 	c.glBlitFramebuffer = getProcAddr("glBlitFramebuffer")
 
 	// Sampler objects (optional - GL 3.3+ / ES 3.0+)

@@ -1019,10 +1019,11 @@ func (c *MSAAResolveCommand) Execute(ctx *gl.Context) {
 func (c *MSAAResolveCommand) ensureResolveFBO(ctx *gl.Context) bool {
 	if c.resolveTexture.fbo == 0 {
 		fbo := ctx.GenFramebuffers(1)
-		ctx.BindFramebuffer(gl.FRAMEBUFFER, fbo)
-		ctx.FramebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+		// Keep READ_FRAMEBUFFER bound to the multisampled source.
+		ctx.BindFramebuffer(gl.DRAW_FRAMEBUFFER, fbo)
+		ctx.FramebufferTexture2D(gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
 			c.resolveTexture.target, c.resolveTexture.id, 0)
-		if ctx.CheckFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE {
+		if ctx.CheckFramebufferStatus(gl.DRAW_FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE {
 			ctx.DeleteFramebuffers(fbo)
 			return false
 		}
