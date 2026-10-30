@@ -896,6 +896,12 @@ func (sc *Swapchain) destroyResourcesAfterIdle() error {
 
 	for _, view := range sc.imageViews {
 		if view != 0 {
+			// A replacement swapchain may reuse this view handle. Remove its
+			// cached framebuffers while the device is idle so a later frame
+			// cannot reuse a framebuffer backed by a retired swapchain image.
+			if sc.device.renderPassCache != nil {
+				sc.device.renderPassCache.InvalidateFramebuffer(view)
+			}
 			vkDestroyImageViewSwapchain(sc.device, view, nil)
 		}
 	}
